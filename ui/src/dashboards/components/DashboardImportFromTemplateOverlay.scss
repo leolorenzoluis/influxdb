@@ -1,0 +1,13 @@
+@import 'src/style/modules';
+
+.import-template-overlay {
+  display: flex;
+  flex-direction: row;
+  width: 90%;
+  align-items: flex-start;
+}
+
+.import-template-overlay--details {
+  min-width: 350px;
+  padding-left: $ix-marg-d;
+}

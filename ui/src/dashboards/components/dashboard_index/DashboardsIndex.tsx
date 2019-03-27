@@ -92,6 +92,7 @@ class DashboardIndex extends PureComponent<Props, State> {
               <AddResourceDropdown
                 onSelectNew={this.handleCreateDashboard}
                 onSelectImport={this.summonImportOverlay}
+                onSelectTemplate={this.summonImportFromTemplateOverlay}
                 resourceName="Dashboard"
               />
             </Page.Header.Right>
@@ -170,6 +171,11 @@ class DashboardIndex extends PureComponent<Props, State> {
   private summonImportOverlay = (): void => {
     const {router} = this.props
     router.push(`/dashboards/import`)
+  }
+
+  private summonImportFromTemplateOverlay = (): void => {
+    const {router} = this.props
+    router.push(`/dashboards/templates`)
   }
 }
 
