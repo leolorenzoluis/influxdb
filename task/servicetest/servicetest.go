@@ -18,7 +18,6 @@ import (
 	"github.com/influxdata/influxdb"
 	icontext "github.com/influxdata/influxdb/context"
 	"github.com/influxdata/influxdb/inmem"
-	"github.com/influxdata/influxdb/pkg/pointer"
 	"github.com/influxdata/influxdb/task"
 	"github.com/influxdata/influxdb/task/backend"
 	"github.com/influxdata/influxdb/task/options"
@@ -365,8 +364,8 @@ func testTaskCRUD(t *testing.T, sys *System) {
 
 	// Update task: switch to every.
 	newStatus = string(backend.TaskActive)
-	newFlux = "import \"http\"\n\noption task = {\n\tname: \"task-changed #98\",\n\tevery: 30000000000ns,\n\toffset: 5s,\n\tconcurrency: 100,\n}\n\nfrom(bucket: \"b\")\n\t|> http.to(url: \"http://example.com\")"
-	f, err = sys.TaskService.UpdateTask(authorizedCtx, origID, influxdb.TaskUpdate{Options: options.Options{Every: 30 * time.Second}})
+	newFlux = "import \"http\"\n\noption task = {\n\tname: \"task-changed #98\",\n\tevery: 30s,\n\toffset: 5s,\n\tconcurrency: 100,\n}\n\nfrom(bucket: \"b\")\n\t|> http.to(url: \"http://example.com\")"
+	f, err = sys.TaskService.UpdateTask(authorizedCtx, origID, influxdb.TaskUpdate{Options: options.Options{Every: *(options.MustParseDuration("30s"))}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -450,7 +449,7 @@ from(bucket: "b")
 
 	expectedFlux := `import "http"
 
-option task = {name: "task-Options-Update", every: 10000000000ns, concurrency: 100}
+option task = {name: "task-Options-Update", every: 10s, concurrency: 100}
 
 from(bucket: "b")
 	|> http.to(url: "http://example.com")`
@@ -467,7 +466,7 @@ from(bucket: "b")
 	if err != nil {
 		t.Fatal(err)
 	}
-	f, err := sys.TaskService.UpdateTask(authorizedCtx, task.ID, influxdb.TaskUpdate{Options: options.Options{Offset: pointer.Duration(0), Every: 10 * time.Second}})
+	f, err := sys.TaskService.UpdateTask(authorizedCtx, task.ID, influxdb.TaskUpdate{Options: options.Options{Offset: &options.Duration{}, Every: *(options.MustParseDuration("10s"))}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1026,7 +1025,7 @@ func testTaskConcurrency(t *testing.T, sys *System) {
 			// Create a run for the last task we found.
 			// The script should run every minute, so use max now.
 			tid := tasks[len(tasks)-1].ID
-			if _, err := sys.TaskControlService.CreateNextRun(sys.Ctx, tid, math.MaxInt64); err != nil {
+			if _, err := sys.TaskControlService.CreateNextRun(sys.Ctx, tid, math.MaxInt64>>6); err != nil {
 				// This may have errored due to the task being deleted. Check if the task still exists.
 
 				if _, err2 := sys.TaskService.FindTaskByID(sys.Ctx, tid); err2 == backend.ErrTaskNotFound {

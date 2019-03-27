@@ -7,6 +7,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
+
+	"github.com/influxdata/flux/parser"
+
+	"github.com/influxdata/flux/ast"
 
 	"github.com/influxdata/flux"
 	"github.com/influxdata/flux/semantic"
@@ -40,22 +45,129 @@ type Options struct {
 
 	// Every represents a fixed period to repeat execution.
 	// this can be unmarshaled from json as a string i.e.: "1d" will unmarshal as 1 day
-	Every time.Duration `json:"every,omitempty"`
+	Every Duration `json:"every,omitempty"`
 
 	// Offset represents a delay before execution.
 	// this can be unmarshaled from json as a string i.e.: "1d" will unmarshal as 1 day
-	Offset *time.Duration `json:"offset,omitempty"`
+	Offset *Duration `json:"offset,omitempty"`
 
 	Concurrency *int64 `json:"concurrency,omitempty"`
 
 	Retry *int64 `json:"retry,omitempty"`
 }
 
+type Duration struct {
+	Node ast.DurationLiteral
+}
+
+func (a Duration) String() string {
+	return ast.Format(&a.Node)
+}
+
+func (a *Duration) Parse(s string) error {
+	q, err := parseSignedDuration(s)
+	if err != nil {
+		return err
+	}
+	a.Node = *q
+	return nil
+}
+
+func MustParseDuration(s string) (dur *Duration) {
+	dur = &Duration{}
+	if err := dur.Parse(s); err != nil {
+		panic(err)
+	}
+	return dur
+}
+
+// parseSignedDuration will convert a string into a possibly negative DurationLiteral.
+// TODO(docmerlin): switch to the one in flux
+func parseSignedDuration(lit string) (*ast.DurationLiteral, error) {
+	r, s := utf8.DecodeRuneInString(lit)
+	if r == '-' {
+		d, err := parser.ParseDuration(lit[s:])
+		if err != nil {
+			return nil, err
+		}
+		for i := range d.Values {
+			d.Values[i].Magnitude = -d.Values[i].Magnitude
+		}
+		d.BaseNode = ast.BaseNode{}
+		return d, nil
+	}
+	d, err := parser.ParseDuration(lit)
+	if err != nil {
+		return nil, err
+	}
+	d.BaseNode = ast.BaseNode{}
+	return d, err
+}
+
+func (a *Duration) UnmarshalText(text []byte) error {
+	q, err := parseSignedDuration(string(text))
+	if err != nil {
+		return err
+	}
+	a.Node = *q
+	return nil
+}
+
+func (a Duration) MarshalText() ([]byte, error) {
+	return []byte(a.String()), nil
+}
+
+func (a Duration) MartialJSON() ([]byte, error) {
+	q := a.String()
+	res := make([]byte, len(q)+2)
+	res[0] = '"'
+	res[len(res)-1] = '"'
+	copy(res[1:len(res)-1], q)
+	return res, nil
+}
+
+// IsZero checks if each segment of the duration is zero, it doesn't check if the Duration sums to zero, just if each internal duration is zero.
+func (a *Duration) IsZero() bool {
+	for i := range a.Node.Values {
+		if a.Node.Values[i].Magnitude != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *Duration) UnmartialJSON(b []byte) error {
+	if len(b) < 2 {
+		return errors.New("duration json must be at least 2 bytes long including the quotes")
+	}
+	x, err := parseSignedDuration(string(b[1 : len(b)-1]))
+	if err != nil {
+		return err
+	}
+	a.Node = *x
+	return nil
+}
+
+// DurationFrom gives us a time.Duration from a time.
+// Currently because of how flux works, this is just an approfimation for any time unit larger than hours.
+func (a *Duration) DurationFrom(t time.Time) (time.Duration, error) {
+	return ast.DurationFrom(&a.Node, t)
+}
+
+// Add adds the duration to a time.
+func (a *Duration) Add(t time.Time) (time.Time, error) {
+	d, err := ast.DurationFrom(&a.Node, t)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return t.Add(d), nil
+}
+
 // Clear clears out all options in the options struct, it us useful if you wish to reuse it.
 func (o *Options) Clear() {
 	o.Name = ""
 	o.Cron = ""
-	o.Every = 0
+	o.Every = Duration{}
 	o.Offset = nil
 	o.Concurrency = nil
 	o.Retry = nil
@@ -64,7 +176,7 @@ func (o *Options) Clear() {
 func (o *Options) IsZero() bool {
 	return o.Name == "" &&
 		o.Cron == "" &&
-		o.Every == 0 &&
+		o.Every.IsZero() &&
 		o.Offset == nil &&
 		o.Concurrency == nil &&
 		o.Retry == nil
@@ -80,6 +192,42 @@ const (
 	optRetry       = "retry"
 )
 
+// contains is a helper function to see if an array of strings contains a string
+func contains(s []string, e string) bool {
+	for i := range s {
+		if s[i] == e {
+			return true
+		}
+	}
+	return false
+}
+
+func grabTaskOptionAST(p *ast.Package, keys ...string) map[string]ast.Expression {
+	res := make(map[string]ast.Expression, 2) // we preallocate two keys for the map, as that is how many we will use at maximum (offset and every)
+	for i := range p.Files {
+		for j := range p.Files[i].Body {
+			if p.Files[i].Body[j].Type() == "OptionStatement" {
+				opt := (p.Files[i].Body[j]).(*ast.OptionStatement)
+				if opt.Assignment.Type() == "VariableAssignment" {
+					asmt := opt.Assignment.(*ast.VariableAssignment)
+					if asmt.ID.Key() == "task" {
+						if ae, ok := asmt.Init.(*ast.ObjectExpression); ok {
+							for k := range ae.Properties {
+								prop := ae.Properties[k]
+								if key := prop.Key.Key(); prop != nil && contains(keys, key) {
+									res[key] = prop.Value
+								}
+							}
+							return res
+						}
+					}
+				}
+			}
+		}
+	}
+	return res
+}
+
 // FromScript extracts Options from a Flux script.
 func FromScript(script string) (Options, error) {
 	if optionCache != nil {
@@ -93,7 +241,12 @@ func FromScript(script string) (Options, error) {
 	}
 	opt := Options{Retry: pointer.Int64(1), Concurrency: pointer.Int64(1)}
 
-	_, scope, err := flux.Eval(script)
+	fluxAST, err := flux.Parse(script)
+	if err != nil {
+		return opt, err
+	}
+	durTypes := grabTaskOptionAST(fluxAST, optEvery, optOffset)
+	_, scope, err := flux.EvalAST(fluxAST)
 	if err != nil {
 		return opt, err
 	}
@@ -102,6 +255,10 @@ func FromScript(script string) (Options, error) {
 	task, ok := scope.Lookup("task")
 	if !ok {
 		return opt, errors.New("missing required option: 'task'")
+	}
+	// check to make sure task is an object
+	if err := checkNature(task.PolyType().Nature(), semantic.Object); err != nil {
+		return opt, err
 	}
 	optObject := task.Object()
 	if err := validateOptionNames(optObject); err != nil {
@@ -138,14 +295,39 @@ func FromScript(script string) (Options, error) {
 		if err := checkNature(everyVal.PolyType().Nature(), semantic.Duration); err != nil {
 			return opt, err
 		}
-		opt.Every = everyVal.Duration().Duration()
+		dur, ok := durTypes["every"]
+		if !ok || dur == nil {
+			return opt, errors.New("failed to parse `every` in task")
+		}
+		durNode, err := parseSignedDuration(dur.Location().Source)
+		if err != nil {
+			return opt, err
+		}
+		if !ok || durNode == nil {
+			return opt, errors.New("failed to parse `every` in task")
+		}
+		durNode.BaseNode = ast.BaseNode{}
+		opt.Every.Node = *durNode
 	}
 
 	if offsetVal, ok := optObject.Get(optOffset); ok {
 		if err := checkNature(offsetVal.PolyType().Nature(), semantic.Duration); err != nil {
 			return opt, err
 		}
-		opt.Offset = pointer.Duration(offsetVal.Duration().Duration())
+		dur, ok := durTypes["offset"]
+		if !ok || dur == nil {
+			return opt, errors.New("failed to parse `offset` in task")
+		}
+		durNode, err := parseSignedDuration(dur.Location().Source)
+		if err != nil {
+			return opt, err
+		}
+		if !ok || durNode == nil {
+			return opt, errors.New("failed to parse `offset` in task")
+		}
+		durNode.BaseNode = ast.BaseNode{}
+		opt.Offset = &Duration{}
+		opt.Offset.Node = *durNode
 	}
 
 	if concurrencyVal, ok := optObject.Get(optConcurrency); ok {
@@ -177,13 +359,14 @@ func FromScript(script string) (Options, error) {
 
 // Validate returns an error if the options aren't valid.
 func (o *Options) Validate() error {
+	now := time.Now()
 	var errs []string
 	if o.Name == "" {
 		errs = append(errs, "name required")
 	}
 
 	cronPresent := o.Cron != ""
-	everyPresent := o.Every != 0
+	everyPresent := !o.Every.IsZero()
 	if cronPresent == everyPresent {
 		// They're both present or both missing.
 		errs = append(errs, "must specify exactly one of either cron or every")
@@ -193,16 +376,25 @@ func (o *Options) Validate() error {
 			errs = append(errs, "cron invalid: "+err.Error())
 		}
 	} else if everyPresent {
-		if o.Every < time.Second {
+		every, err := o.Every.DurationFrom(now)
+		if err != nil {
+			return err
+		}
+		if every < time.Second {
 			errs = append(errs, "every option must be at least 1 second")
-		} else if o.Every.Truncate(time.Second) != o.Every {
+		} else if every.Truncate(time.Second) != every {
 			errs = append(errs, "every option must be expressible as whole seconds")
 		}
 	}
-
-	if o.Offset != nil && o.Offset.Truncate(time.Second) != *o.Offset {
-		// For now, allowing negative offset delays. Maybe they're useful for forecasting?
-		errs = append(errs, "offset option must be expressible as whole seconds")
+	if o.Offset != nil {
+		offset, err := o.Offset.DurationFrom(now)
+		if err != nil {
+			return err
+		}
+		if offset.Truncate(time.Second) != offset {
+			// For now, allowing negative offset delays. Maybe they're useful for forecasting?
+			errs = append(errs, "offset option must be expressible as whole seconds")
+		}
 	}
 	if o.Concurrency != nil {
 		if *o.Concurrency < 1 {
@@ -231,11 +423,15 @@ func (o *Options) Validate() error {
 // If the every option was specified, it is converted into a cron string using "@every".
 // Otherwise, the empty string is returned.
 // The value of the offset option is not considered.
+// TODO(docmerlin): create an EffectiveCronStringFrom(t time.Time) string,
+// that works from a unit of time.
+// Do not use this if you haven't checked for validity already.
 func (o *Options) EffectiveCronString() string {
 	if o.Cron != "" {
 		return o.Cron
 	}
-	if o.Every > 0 {
+	every, _ := o.Every.DurationFrom(time.Now()) // we can ignore errors here because we have alreach checked for validity.
+	if every > 0 {
 		return "@every " + o.Every.String()
 	}
 	return ""
